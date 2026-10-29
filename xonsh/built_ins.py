@@ -1052,6 +1052,19 @@ class XonshSession:
         self.lastcmd = None
         self._last = None
         self.sessionid = str(uuid.uuid4())
+        # envtrace state; created lazily via the ``envtrace`` property so
+        # sessions that never use the feature pay nothing. Env.detype() and
+        # SubprocSpec.run() read this attribute directly for the same reason.
+        self._envtrace = None
+
+    @property
+    def envtrace(self):
+        """State for the ``envtrace`` builtin (lazily created)."""
+        if self._envtrace is None:
+            from xonsh.envtrace import EnvTraceState
+
+            self._envtrace = EnvTraceState()
+        return self._envtrace
 
     @property
     def last(self):
@@ -1146,6 +1159,10 @@ class XonshSession:
         self.exit = None
         self.stdout_uncaptured = None
         self.stderr_uncaptured = None
+
+        # A freshly loaded session never has an active envtrace round.
+        if self._envtrace is not None:
+            self._envtrace.reset()
 
         self._disable_python_exit()
 

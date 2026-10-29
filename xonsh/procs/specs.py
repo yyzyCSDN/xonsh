@@ -624,17 +624,36 @@ class SubprocSpec:
     def run(self, *, pipeline_group=None):
         """Launches the subprocess and returns the object."""
         event_name = self._cmd_event_name()
-        self._pre_run_event_fire(event_name)
-        kwargs = {n: getattr(self, n) for n in self.kwnames}
-        if callable(self.alias):
-            kwargs["env"] = self.env or {}
-            kwargs["env"]["__ALIAS_NAME"] = self.alias_name or ""
-            p = self.cls(self.alias, self.cmd, **kwargs)
+        # envtrace records only real external processes; callable aliases
+        # are Python functions/threads, not child processes.
+        envtrace = getattr(XSH, "_envtrace", None)
+        trace_scope = None
+        if envtrace is not None and envtrace.active and not callable(self.alias):
+            trace_scope = envtrace.begin_spec(self)
+        try:
+            self._pre_run_event_fire(event_name)
+            if trace_scope is not None:
+                # Snapshot what the hooks changed before anything else could
+                # touch the launch environment.
+                envtrace.hooks_fired(self, trace_scope)
+            kwargs = {n: getattr(self, n) for n in self.kwnames}
+            if callable(self.alias):
+                kwargs["env"] = self.env or {}
+                kwargs["env"]["__ALIAS_NAME"] = self.alias_name or ""
+                p = self.cls(self.alias, self.cmd, **kwargs)
+            else:
+                self.prep_env_subproc(kwargs)
+                self.prep_preexec_fn(kwargs, pipeline_group=pipeline_group)
+                self._fix_null_cmd_bytes()
+                p = self._run_binary(kwargs)
+        except BaseException:
+            if trace_scope is not None:
+                envtrace.discard(trace_scope)
+            raise
         else:
-            self.prep_env_subproc(kwargs)
-            self.prep_preexec_fn(kwargs, pipeline_group=pipeline_group)
-            self._fix_null_cmd_bytes()
-            p = self._run_binary(kwargs)
+            if trace_scope is not None and p is not None:
+                # Commit against the env mapping that really went to Popen.
+                envtrace.commit(self, kwargs.get("env"), trace_scope)
         p.spec = self
         p.last_in_pipeline = self.last_in_pipeline
         p.captured_stdout = self.captured_stdout

@@ -25,6 +25,7 @@ import xonsh.xoreutils.xcontext as xxt
 from xonsh.built_ins import XSH
 from xonsh.cli_utils import Annotated, Arg, ArgParserAlias
 from xonsh.dirstack import _get_cwd, cd, dirs, popd, pushd
+from xonsh.envtrace import envtrace as envtrace_alias
 from xonsh.environ import locate_binary, make_args_env
 from xonsh.foreign_shells import (
     CANON_SHELL_NAMES,
@@ -1711,6 +1712,7 @@ def make_default_aliases():
         "source-foreign": source_foreign,
         "history": xhm.history_main,
         "trace": trace,
+        "envtrace": envtrace_alias,
         "timeit": timeit_alias,
         "xonfig": xonfig,
         "showcmd": showcmd,

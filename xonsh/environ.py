@@ -2548,10 +2548,18 @@ class Env(cabc.MutableMapping):
             if isinstance(path_val, EnvPath):
                 path_val._l = [p for p in path_val._l if str(p).strip()]
         if "PATH" not in self._d:
-            # this is here so the PATH is accessible to subprocs and so that
-            # it can be modified in-place in the xonshrc file
+            # this is here so that the PATH is accessible to subprocs and
+            # so that it can be modified in-place in the xonshrc file
             self._d["PATH"] = EnvPath(PATH_DEFAULT)
         self._detyped = None
+        # Provenance that envtrace collected while ``self._detyped`` was
+        # built (see xonsh/envtrace.py). ``None`` means the cache was built
+        # while envtrace was not collecting, so its sources are unknown.
+        self._detyped_trace = None
+
+    def _invalidate_detyped_cache(self):
+        self._detyped = None
+        self._detyped_trace = None
 
     def get_detyped(self, key: str):
         detyped = self.detype()
@@ -2563,8 +2571,14 @@ class Env(cabc.MutableMapping):
         Note! If env variable wasn't explicitly set (e.g. the value has default value in ``Xettings``)
         it will be not in this list.
         """
+        tracer = getattr(XSH, "_envtrace", None)
+        tracing = tracer is not None and tracer.active
         if self._detyped is not None and not self._overlay_stack:
+            if tracing:
+                # envtrace observes the cache hit but never recomputes it.
+                tracer.detype_cache_hit(self)
             return self._detyped
+        collector = tracer.detype_begin(self) if tracing else None
         ctx = {}
         items = dict(self._d)
         # Apply overlay values on top (most recent overlay wins)
@@ -2574,12 +2588,16 @@ class Env(cabc.MutableMapping):
             # Skip variables masked by DELETE_VAR — they must not reach
             # subprocess.Popen as a stringified sentinel.
             if val is DELETE_VAR:
+                if collector is not None:
+                    collector.note_masked(key)
                 continue
             if not isinstance(key, str):
                 key = str(key)
             detyper = self.get_detyper(key)
             if detyper is None:
                 # cannot be detyped
+                if collector is not None:
+                    collector.note_no_detyper(key, val, detyper)
                 continue
             try:
                 deval = detyper(val)
@@ -2587,10 +2605,26 @@ class Env(cabc.MutableMapping):
                 raise RuntimeError(f"Error during detyping ${key}: {exc}") from exc
             if deval is None:
                 # cannot be detyped
+                if collector is not None:
+                    collector.note_none(key, val, detyper)
                 continue
             ctx[key] = deval
+            if collector is not None:
+                collector.note_exported(key, val, deval, detyper)
         if not self._overlay_stack:
             self._detyped = ctx
+            if collector is not None:
+                trace_payload = collector.payload()
+                self._detyped_trace = trace_payload
+                collector.deliver(
+                    trace_payload, cache_used=False, sources_collected=True
+                )
+        elif collector is not None:
+            # Overlay detyping is never cached; deliver the freshly
+            # collected facts directly to the launch in progress.
+            collector.deliver(
+                collector.payload(), cache_used=False, sources_collected=True
+            )
         return ctx
 
     def detype_all(self):
@@ -2878,7 +2912,7 @@ class Env(cabc.MutableMapping):
         if isinstance(
             val, cabc.MutableSet | cabc.MutableSequence | cabc.MutableMapping
         ):
-            self._detyped = None
+            self._invalidate_detyped_cache()
         if isinstance(val, EnvPath):
             val.target_env_var = key
         return val
@@ -2902,7 +2936,7 @@ class Env(cabc.MutableMapping):
             #     was not set, silently no-op (matches "absent" intent).
             if thread_local:
                 self._d.set_locally(key, DELETE_VAR)
-                self._detyped = None
+                self._invalidate_detyped_cache()
             elif key in self._d:
                 self._del_item(key)
             return
@@ -2953,7 +2987,7 @@ class Env(cabc.MutableMapping):
             self._d.set_locally(key, val)
         else:
             self._d[key] = val
-        self._detyped = None
+        self._invalidate_detyped_cache()
         if self.get("UPDATE_OS_ENVIRON"):
             if self._orig_env is None:
                 try:
@@ -2964,7 +2998,7 @@ class Env(cabc.MutableMapping):
                         del self._d[key]
                     else:
                         self._d[key] = old_value
-                    self._detyped = None
+                    self._invalidate_detyped_cache()
                     raise
             elif detyper is None:
                 pass
@@ -2994,7 +3028,7 @@ class Env(cabc.MutableMapping):
                 self._d.del_locally(key)
             else:
                 del self._d[key]
-            self._detyped = None
+            self._invalidate_detyped_cache()
             if self.get("UPDATE_OS_ENVIRON") and key in os_environ:
                 del os_environ[key]
         elif key not in self._vars:

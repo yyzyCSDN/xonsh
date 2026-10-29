@@ -192,4 +192,5 @@ def copy_env(old):
     env._d = internal
     env._vars = env._vars.copy()
     env._detyped = None
+    env._detyped_trace = None
     return env
