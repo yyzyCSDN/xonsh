@@ -8,7 +8,10 @@ import types
 
 from xonsh.parser import Parser
 from xonsh.parsers.ast import CtxAwareTransformer
-from xonsh.parsers.base import wrap_subproc_raise_checks
+from xonsh.parsers.base import (
+    wrap_subproc_cwd_anchors,
+    wrap_subproc_raise_checks,
+)
 from xonsh.tools import (
     balanced_parens,
     ends_with_colon_token,
@@ -117,6 +120,11 @@ class Execer:
         # $[...]) so their final returncode is checked at runtime
         # against $XONSH_SUBPROC_RAISE_ERROR.
         tree = wrap_subproc_raise_checks(tree)
+        # [Phase 4]
+        # Install the statement-level try/finally safety net that keeps
+        # $XONSH_SUBPROC_CWD_ANCHOR anchors from leaking when command
+        # argument evaluation raises.
+        tree = wrap_subproc_cwd_anchors(tree)
         return tree
 
     def compile(

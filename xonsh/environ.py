@@ -1369,6 +1369,26 @@ class SubprocessSetting(Xettings):
         False,
         "If ``True`` the stderr from captured subproc will be printed automatically.",
     )
+    XONSH_SUBPROC_CWD_ANCHOR = Var.with_default(
+        False,
+        "Anchor each subprocess pipeline to the real current directory at the "
+        "moment the pipeline starts being built, before its command name, "
+        "arguments and redirect operands are evaluated. When enabled, a "
+        "Python expression in the command (e.g. ``@()``) that calls "
+        "``os.chdir()`` no longer affects where xonsh resolves filename and "
+        "regex globs, explicit relative executable paths, relative ``$PATH`` "
+        "entries, script interpreter lookups, relative file redirects or the "
+        "working directory of the external subprocesses: all of them stay "
+        "relative to the anchored directory. The whole ``|`` pipeline shares "
+        "one anchor; the next pipeline after ``;``, ``&&`` or ``||`` gets a "
+        "fresh anchor from the then-current directory; nested captured "
+        "commands are anchored independently and the enclosing pipeline keeps "
+        "using its own anchor afterwards. The ``os.chdir()`` side effect itself "
+        "is still applied to the xonsh process and visible to later commands; "
+        "Python expressions are still evaluated exactly once, in order. "
+        "Only xonsh-managed paths and external processes are affected. "
+        "Default ``False`` keeps the historical behaviour.",
+    )
     XONSH_BUILTINS_TO_CMD = Var.with_default(
         False,
         "If True, Python builtin names (e.g. ``dir``, ``zip``, ``type``) "

@@ -5,7 +5,7 @@ import os
 import time
 from pathlib import Path
 
-from xonsh.built_ins import XSH
+from xonsh.built_ins import XSH, current_subproc_cwd_anchor
 from xonsh.lib.itertools import unique_everseen
 from xonsh.platform import ON_WINDOWS
 
@@ -31,7 +31,16 @@ def get_possible_names(name, env=None):
 
 def clear_paths(paths):
     """Remove duplicates and nonexistent directories from paths."""
-    return filter(os.path.isdir, unique_everseen(map(os.path.realpath, paths)))
+    anchor = current_subproc_cwd_anchor()
+
+    def _realpath(p):
+        # Relative $PATH entries (e.g. "." or "bin") are resolved against
+        # the pipeline anchor while CWD anchoring is active.
+        if anchor is not None and not os.path.isabs(p):
+            p = os.path.join(anchor, p)
+        return os.path.realpath(p)
+
+    return filter(os.path.isdir, unique_everseen(map(_realpath, paths)))
 
 
 def get_paths(env=None):
@@ -207,6 +216,11 @@ def locate_relative_path(name, env=None, check_executable=False, use_pathext=Fal
     If the current directory has "binfile" it can be called only by providing a path such as "./binfile" explicitly.
     """
     p = Path(name)
+    anchor = current_subproc_cwd_anchor()
+    if anchor is not None and not p.is_absolute():
+        # Explicit relative command paths (./script, sub/script) resolve
+        # against the pipeline anchor while CWD anchoring is active.
+        p = Path(anchor) / p
     if is_explicit_path(name):
         possible_names = get_possible_names(p.name, env) if use_pathext else [p.name]
         for possible_name in possible_names:

@@ -10,6 +10,7 @@ import atexit
 import builtins
 import collections.abc as cabc
 import contextlib
+import contextvars
 import inspect
 import itertools
 import os
@@ -106,9 +107,139 @@ def superhelper(x, name=""):
     return x
 
 
+class _SubprocCwdAnchor:
+    """Opaque per-pipeline working-directory anchor token.
+
+    Instances are created by :func:`subproc_cwd_anchor_enter` (emitted as
+    the first argument of every parser-generated subproc helper call) and
+    released by :func:`subproc_cwd_anchor_exit` in the helper's
+    ``finally`` block.
+    """
+
+    __slots__ = ("cwd", "prev", "token")
+
+    def __init__(self, cwd, prev, token):
+        #: The real current directory at pipeline construction start.
+        self.cwd = cwd
+        #: The enclosing anchor (None at the outermost level).
+        self.prev = prev
+        #: ContextVar reset token returned when the anchor was pushed.
+        self.token = token
+
+    def __repr__(self):
+        return f"<SubprocCwdAnchor cwd={self.cwd!r}>"
+
+
+_subproc_cwd_anchor_var = contextvars.ContextVar(
+    "xonsh_subproc_cwd_anchor", default=None
+)
+
+
+def current_subproc_cwd_anchor():
+    """Return the active pipeline anchor directory as an absolute path.
+
+    This is the directory against which xonsh-managed relative paths
+    (globs, redirects, relative command paths, relative ``$PATH``
+    entries) and external subprocess working directories are resolved
+    while ``$XONSH_SUBPROC_CWD_ANCHOR`` is enabled. Returns ``None``
+    when the mode is off or no pipeline is being built/executed.
+    """
+    anchor = _subproc_cwd_anchor_var.get()
+    return None if anchor is None else anchor.cwd
+
+
+def subproc_cwd_anchor_enter():
+    """Snapshot the real current directory before atoms are evaluated.
+
+    The parser emits this as the *first* positional argument of each
+    ``subproc_*`` helper call, so Python's left-to-right argument
+    evaluation guarantees it runs before any command name, argument,
+    glob or redirect operand is evaluated. A whole ``|`` pipeline is one
+    helper call and therefore shares one anchor; nested captures push
+    their own anchor on top and restore the enclosing one on return.
+
+    Returns ``None`` (and changes nothing) when the feature is off, so
+    generated code is identical across toggles of the setting.
+    """
+    env = XSH.env
+    if env is None or not env.get("XONSH_SUBPROC_CWD_ANCHOR"):
+        return None
+    prev = _subproc_cwd_anchor_var.get()
+    anchor = _SubprocCwdAnchor(os.getcwd(), prev, None)
+    anchor.token = _subproc_cwd_anchor_var.set(anchor)
+    return anchor
+
+
+def subproc_cwd_anchor_exit(anchor):
+    """Release an anchor previously returned by ``..._enter``.
+
+    Called from the subproc helpers' ``finally`` blocks, so neither
+    pipeline construction nor execution failures can leak the anchor to
+    following commands.
+    """
+    if anchor is None:
+        return
+    if _subproc_cwd_anchor_var.get() is anchor:
+        _subproc_cwd_anchor_var.reset(anchor.token)
+    else:
+        # A nested failure was already cleaned up by the statement-level
+        # safety net; rewind to the anchor's enclosing state.
+        _subproc_cwd_anchor_var.set(anchor.prev)
+
+
+def subproc_cwd_anchor_snapshot():
+    """Capture the current anchor state for a statement-level ``finally``.
+
+    See :func:`subproc_cwd_anchor_restore`.
+    """
+    return _subproc_cwd_anchor_var.get()
+
+
+def subproc_cwd_anchor_restore(snapshot):
+    """Drop anchors leaked while evaluating a statement's expressions.
+
+    If argument evaluation raises before the subproc helper is entered,
+    the helper's own ``finally`` never runs. The parser wraps every
+    statement containing subproc calls so that this runs in a
+    ``finally`` block: any anchor still on top (the leaked one) is
+    discarded, while enclosing anchors that belong to an outer pipeline
+    (e.g. one running a callable alias) are preserved.
+    """
+    if _subproc_cwd_anchor_var.get() is not snapshot:
+        _subproc_cwd_anchor_var.set(snapshot)
+
+
+def anchored_resolve(path):
+    """Resolve a relative path against the active anchor, if any.
+
+    Absolute paths and paths used outside of pipeline construction are
+    returned untouched.
+    """
+    anchor = current_subproc_cwd_anchor()
+    if (
+        anchor is not None
+        and isinstance(path, str)
+        and path
+        and not os.path.isabs(path)
+    ):
+        return os.path.join(anchor, path)
+    return path
+
+
 def reglob(path, parts=None, i=None, include_dotfiles=False):
     """Regular expression-based globbing."""
     if parts is None:
+        anchor = current_subproc_cwd_anchor()
+        if anchor is not None and not os.path.isabs(os.path.normpath(path)):
+            # Resolve the regex glob against the pipeline's CWD anchor,
+            # then hand back anchor-relative paths (same string shape as
+            # the regular, non-anchored expansion).
+            path = os.path.join(anchor, path)
+            drive, tail = os.path.splitdrive(path)
+            parts = tail.split(os.sep)
+            d = os.path.join(drive, os.sep)
+            results = reglob(d, parts, i=0, include_dotfiles=include_dotfiles)
+            return [os.path.relpath(p, anchor) for p in results]
         path = os.path.normpath(path)
         drive, tail = os.path.splitdrive(path)
         parts = tail.split(os.sep)
@@ -315,6 +446,9 @@ def regexmatchsearch(s):
         start = prefix.rsplit("/", 1)[0] or "."
     else:
         start = s if os.path.isdir(s) else os.path.dirname(s) or "."
+    anchor = current_subproc_cwd_anchor()
+    if anchor is not None and not os.path.isabs(start):
+        start = os.path.join(anchor, start)
     results = []
     for root, dirs, files in os.walk(start):
         if not dotglob:
@@ -323,11 +457,12 @@ def regexmatchsearch(s):
             if not dotglob and name.startswith("."):
                 continue
             path = os.path.join(root, name)
-            match = regex.fullmatch(path)
+            match_path = os.path.relpath(path, anchor) if anchor else path
+            match = regex.fullmatch(match_path)
             if match:
                 groups = match.groups()
                 if not groups:
-                    results.append(path)
+                    results.append(match_path)
                 elif len(groups) == 1:
                     results.append(groups[0])
                 else:
@@ -415,7 +550,24 @@ def _check_subproc_helper_raise(in_boolop):
     raise subprocess.CalledProcessError(rtn, spec.args, output=output)
 
 
-def subproc_captured_stdout(*cmds, envs=None, in_boolop=False):
+def _split_cwd_anchor(first, cmds):
+    """Split the parser-generated CWD anchor token from pipeline cmds.
+
+    The parser emits ``subproc_*(<anchor_enter()>, *cmds, ...)`` so the
+    anchor is entered before any command atom is evaluated. Direct
+    Python callers (e.g. ``xonsh.api.subprocess``, tests and user code)
+    do not pass the token; their first positional argument is really the
+    first cmd, so put it back.
+    """
+    if isinstance(first, _SubprocCwdAnchor):
+        return first, cmds
+    # ``None`` is the disabled-mode marker produced by anchor_enter().
+    if first is None:
+        return None, cmds
+    return None, (first, *cmds)
+
+
+def subproc_captured_stdout(first=None, *cmds, envs=None, in_boolop=False):
     """Runs a subprocess, capturing the output. Returns the stdout
     that was produced as a str or list based on ``$XONSH_SUBPROC_OUTPUT_FORMAT``.
 
@@ -424,70 +576,90 @@ def subproc_captured_stdout(*cmds, envs=None, in_boolop=False):
     (e.g. suppress ``$XONSH_SUBPROC_CMD_RAISE_ERROR`` to let the chain
     short-circuit on returncode).
     """
+    anchor, cmds = _split_cwd_anchor(first, cmds)
 
     import xonsh.procs.specs
 
-    r = xonsh.procs.specs.run_subproc(
-        cmds, captured="stdout", envs=envs, in_boolop=in_boolop
-    )
-    _check_subproc_helper_raise(in_boolop)
-    return r
+    try:
+        r = xonsh.procs.specs.run_subproc(
+            cmds, captured="stdout", envs=envs, in_boolop=in_boolop
+        )
+        _check_subproc_helper_raise(in_boolop)
+        return r
+    finally:
+        subproc_cwd_anchor_exit(anchor)
 
 
-def subproc_captured_inject(*cmds, envs=None, in_boolop=False):
+def subproc_captured_inject(first=None, *cmds, envs=None, in_boolop=False):
     """Runs a subprocess, capturing the output. Returns a list of
     whitespace-separated strings of the stdout that was produced.
     The string is split using xonsh's lexer, rather than Python's str.split()
     or shlex.split().
     """
+    anchor, cmds = _split_cwd_anchor(first, cmds)
     import xonsh.procs.specs
 
-    o = xonsh.procs.specs.run_subproc(
-        cmds, captured="stdout", envs=envs, in_boolop=in_boolop
-    )
-    _check_subproc_helper_raise(in_boolop)
-    o = o if isinstance(o, list) else o.splitlines()
-    toks = []
-    for line in o:
-        line = line.rstrip(os.linesep)
-        toks.extend(XSH.execer.parser.lexer.split(line))
-    return toks
+    try:
+        o = xonsh.procs.specs.run_subproc(
+            cmds, captured="stdout", envs=envs, in_boolop=in_boolop
+        )
+        _check_subproc_helper_raise(in_boolop)
+        o = o if isinstance(o, list) else o.splitlines()
+        toks = []
+        for line in o:
+            line = line.rstrip(os.linesep)
+            toks.extend(XSH.execer.parser.lexer.split(line))
+        return toks
+    finally:
+        subproc_cwd_anchor_exit(anchor)
 
 
-def subproc_captured_object(*cmds, envs=None, in_boolop=False):
+def subproc_captured_object(first=None, *cmds, envs=None, in_boolop=False):
     """
     Runs a subprocess, capturing the output. Returns an instance of
     CommandPipeline representing the completed command.
     """
+    anchor, cmds = _split_cwd_anchor(first, cmds)
     import xonsh.procs.specs
 
-    return xonsh.procs.specs.run_subproc(
-        cmds, captured="object", envs=envs, in_boolop=in_boolop
-    )
+    try:
+        return xonsh.procs.specs.run_subproc(
+            cmds, captured="object", envs=envs, in_boolop=in_boolop
+        )
+    finally:
+        subproc_cwd_anchor_exit(anchor)
 
 
-def subproc_captured_hiddenobject(*cmds, envs=None, in_boolop=False):
+def subproc_captured_hiddenobject(first=None, *cmds, envs=None, in_boolop=False):
     """Runs a subprocess, capturing the output. Returns an instance of
     HiddenCommandPipeline representing the completed command.
     """
+    anchor, cmds = _split_cwd_anchor(first, cmds)
     import xonsh.procs.specs
 
-    return xonsh.procs.specs.run_subproc(
-        cmds, captured="hiddenobject", envs=envs, in_boolop=in_boolop
-    )
+    try:
+        return xonsh.procs.specs.run_subproc(
+            cmds, captured="hiddenobject", envs=envs, in_boolop=in_boolop
+        )
+    finally:
+        subproc_cwd_anchor_exit(anchor)
 
 
-def subproc_uncaptured(*cmds, envs=None, in_boolop=False):
+def subproc_uncaptured(first=None, *cmds, envs=None, in_boolop=False):
     """Runs a subprocess, without capturing the output. Returns the stdout
     that was produced as a str.
     """
+    anchor, cmds = _split_cwd_anchor(first, cmds)
     import xonsh.procs.specs
 
-    r = xonsh.procs.specs.run_subproc(
-        cmds, captured=False, envs=envs, in_boolop=in_boolop
-    )
-    _check_subproc_helper_raise(in_boolop)
-    return r
+    try:
+        r = xonsh.procs.specs.run_subproc(
+            cmds, captured=False, envs=envs, in_boolop=in_boolop
+        )
+        _check_subproc_helper_raise(in_boolop)
+        return r
+    finally:
+        subproc_cwd_anchor_exit(anchor)
 
 
 def subproc_check_boolop(value):
@@ -1028,6 +1200,11 @@ class XonshSession:
         self.subproc_captured_hiddenobject = subproc_captured_hiddenobject
         self.subproc_uncaptured = subproc_uncaptured
         self.subproc_check_boolop = subproc_check_boolop
+        self.subproc_cwd_anchor_enter = subproc_cwd_anchor_enter
+        self.subproc_cwd_anchor_exit = subproc_cwd_anchor_exit
+        self.subproc_cwd_anchor_snapshot = subproc_cwd_anchor_snapshot
+        self.subproc_cwd_anchor_restore = subproc_cwd_anchor_restore
+        self.current_subproc_cwd_anchor = current_subproc_cwd_anchor
         self.call_macro = call_macro
         self.enter_macro = enter_macro
         self.path_literal = path_literal

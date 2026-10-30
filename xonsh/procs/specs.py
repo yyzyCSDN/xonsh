@@ -17,7 +17,7 @@ import xonsh.lib.lazyimps as xli
 import xonsh.platform as xp
 import xonsh.procs.jobs as xj
 import xonsh.tools as xt
-from xonsh.built_ins import XSH
+from xonsh.built_ins import XSH, anchored_resolve, current_subproc_cwd_anchor
 from xonsh.procs.executables import (
     get_possible_names,
     is_file,
@@ -261,6 +261,10 @@ _PIPE_ERR = _PipeRedirectSentinel("e>p")
 
 def safe_open(fname, mode, buffering=-1):
     """Safely attempts to open a file in for xonsh subprocs."""
+    # Redirect targets are relative to the pipeline anchor when CWD
+    # anchoring is active, even if earlier expressions changed the real
+    # working directory.
+    fname = anchored_resolve(fname)
     # file descriptors
     try:
         kwargs = {"encoding": "utf-8"} if "b" not in mode else {}
@@ -634,6 +638,14 @@ class SubprocSpec:
             self.prep_env_subproc(kwargs)
             self.prep_preexec_fn(kwargs, pipeline_group=pipeline_group)
             self._fix_null_cmd_bytes()
+            anchor = current_subproc_cwd_anchor()
+            if anchor is not None:
+                # Run the external program in the anchored directory so
+                # that relative operands (globs, redirects, literal
+                # relative args) resolve the same way they did while the
+                # command was being built, even if @() expressions in it
+                # changed the real working directory.
+                kwargs.setdefault("cwd", anchor)
             p = self._run_binary(kwargs)
         p.spec = self
         p.last_in_pipeline = self.last_in_pipeline
@@ -659,7 +671,11 @@ class SubprocSpec:
             if xp.ON_WINDOWS and self.binary_loc is None:
                 cmd0 = cmd[0]
                 if cmd0 and not _has_path_component(cmd0):
-                    if any(is_file(n) for n in get_possible_names(cmd0)):
+                    anchor = current_subproc_cwd_anchor()
+                    if any(
+                        is_file(os.path.join(anchor, n)) if anchor else is_file(n)
+                        for n in get_possible_names(cmd0)
+                    ):
                         raise FileNotFoundError(cmd0)
             p = self.cls(cmd, bufsize=bufsize, **kwargs)
         except PermissionError as ex:
@@ -926,7 +942,7 @@ class SubprocSpec:
             and self.binary_loc is None
             and len(self.cmd) == 1
             and XSH.env.get("AUTO_CD")
-            and os.path.isdir(self.cmd[0])
+            and os.path.isdir(anchored_resolve(self.cmd[0]))
         ):
             return
         self.cmd.insert(0, "cd")
@@ -955,8 +971,9 @@ class SubprocSpec:
         fname = self.binary_loc
         if fname is None:
             cmd0 = self.cmd[0] if self.cmd else None
-            if cmd0 and _has_path_component(cmd0) and os.path.isfile(cmd0):
-                fname = os.path.abspath(cmd0)
+            cmd0_path = anchored_resolve(cmd0)
+            if cmd0 and _has_path_component(cmd0) and os.path.isfile(cmd0_path):
+                fname = os.path.abspath(cmd0_path)
         if fname is None:
             return
         try:

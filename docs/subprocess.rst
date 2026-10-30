@@ -179,6 +179,80 @@ You can use the same function directly to split any command string:
     # ['echo', '"hello world"', 'file.txt']
 
 
+.. _subproc-cwd-anchor:
+
+Anchoring subprocesses to one working directory
+================================================
+
+Xonsh evaluates the arguments of a command line left to right, and a
+Python expression injected with ``@()`` is real Python code -- it may
+call ``os.chdir()`` (or yield values from an iterator that does). When
+that happens, the parts of the command that xonsh resolves *after* the
+call suddenly see a different working directory than the parts resolved
+*before* it. For example::
+
+    # we are in directory A; B also contains a file called data.txt
+    grep -f data.txt @(do_something_that_chdirs_to_B())
+
+The ``data.txt`` operand is just a relative string, so the external
+program opens it relative to *its own* working directory -- which is now
+``B``. The program silently reads a different file than the one xonsh
+saw while expanding the line, and filename/regex globs (``*.txt``,
+``backtick`` patterns), explicit relative command paths
+(``./script``), relative ``$PATH`` entries and relative redirects are
+resolved against the new directory as well.
+
+Setting ``$XONSH_SUBPROC_CWD_ANCHOR = True`` makes every pipeline
+deterministic in this situation:
+
+* Before xonsh starts evaluating the command name, arguments and
+  redirect operands of a pipeline, it snapshots the *real* current
+  directory and uses it as the pipeline's **anchor**.
+* Filename globs (``*``/``**``) and regex globs (`` `pattern` ``),
+  explicit relative executable paths (``./script``), relative
+  ``$PATH`` entries, the existing interpreter resolution for scripts,
+  relative file redirects (``> file``, ``< file``) and the working
+  directory of every external subprocess in the pipeline are all
+  resolved relative to that anchor.
+* The whole ``|`` pipeline shares a single anchor.
+* The next pipeline after ``;`` and the pipeline that actually runs in
+  an ``&&`` / ``||`` chain get a fresh anchor, based on the current
+  directory at the moment they start.
+* A nested captured command (``$(...)``, ``!(...)``, ``![...]``,
+  ``$[...]``, ``@$(...)`` used as an argument) is anchored
+  independently, using the real directory when *its* construction
+  starts; after it returns, the enclosing pipeline keeps using its own
+  anchor.
+
+The Python expressions themselves are untouched: they are still
+evaluated exactly once, in their original order, iterators are still
+consumed lazily in place, and an actual ``os.chdir()`` side effect is
+kept -- the xonsh process really is in the new directory and subsequent
+commands see it. Only xonsh-managed path resolution and external
+processes are redirected to the anchor. If an argument fails to build
+or the command fails to start, the anchor is discarded and never leaks
+to following commands.
+
+.. code-block:: xonshcon
+
+    >>> $XONSH_SUBPROC_CWD_ANCHOR = True
+    >>> pwd
+    /home/you/A
+    >>> touch data.txt
+    >>> mkdir ../B && touch ../B/data.txt
+    >>> # even though the @() call chdirs to B, grep runs in A and reads A's file
+    >>> grep -f data.txt @(os.chdir('../B'))
+    contents of /home/you/A/data.txt
+    >>> pwd  # the parent shell really did move to B
+    /home/you/B
+
+Callable aliases are Python, so they continue to run in the real
+working directory; when they themselves launch captured commands, those
+get their own, correctly nested anchors. The setting defaults to
+``False``, and when it is off (or when a command has no directory
+changing side effects) behavior is exactly as before.
+
+
 Threading
 =========
 

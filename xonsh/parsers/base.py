@@ -1,5 +1,6 @@
 """Implements the base xonsh parser."""
 
+import ast as _pyast
 import itertools
 import os
 import re
@@ -235,6 +236,180 @@ def wrap_subproc_raise_checks(tree):
     result is checked at runtime against ``$XONSH_SUBPROC_RAISE_ERROR``.
     """
     return _SubprocChainRaiseWrapper().visit(tree)
+
+
+# Statement-list AST fields; expression evaluation inside such nested
+# blocks happens at a different time than the enclosing statement, so
+# they are recursively transformed instead of treated as expressions of
+# the current statement.
+_STMT_LIST_FIELDS = frozenset(("body", "orelse", "finalbody"))
+
+# ast.Match only exists on Python 3.10+; xonsh still parses older syntax.
+_AST_MATCH = getattr(_pyast, "Match", None)
+
+
+class _SubprocCwdAnchorWrapper:
+    """AST post-pass that makes CWD-anchor cleanup exception-safe.
+
+    Every subproc helper call is emitted with
+    ``__xonsh__.subproc_cwd_anchor_enter()`` as its first argument, which
+    pushes the pipeline anchor before command atoms are evaluated. The
+    helpers themselves pop the anchor in ``finally`` blocks. If, however,
+    evaluating the arguments raises *before* the helper is entered (e.g.
+    ``echo @(1/0)``), that ``finally`` never runs and the anchor would
+    remain visible to subsequent commands.
+
+    This pass therefore wraps every statement whose own expressions may
+    invoke a subproc helper in::
+
+        <snap> = __xonsh__.subproc_cwd_anchor_snapshot()
+        try:
+            <statement>
+        finally:
+            __xonsh__.subproc_cwd_anchor_restore(<snap>)
+
+    Nested statement blocks (function/class/loop/try bodies, match
+    cases) are transformed independently because they execute at a
+    different time; anchors pushed by an outer pipeline while e.g. a
+    callable alias runs are preserved through the restore (it only drops
+    entries newer than the snapshot). When the feature is off the
+    snapshot is ``None`` and restore is a cheap no-op.
+    """
+
+    def wrap(self, tree):
+        if isinstance(tree, (_pyast.Module, _pyast.Interactive)):
+            # NOTE: do not call ast.fix_missing_locations() here: most
+            # parser-generated expression nodes intentionally have no
+            # end_lineno/end_col_offset and compile() fills those itself;
+            # fix_missing_locations would stamp them with inherited
+            # (possibly invalid) ranges. New statement nodes created here
+            # carry fully explicit, valid ranges.
+            tree.body = self._stmts(tree.body)
+        # ast.Expression (parser "eval" mode) has no statement boundary;
+        # nothing can be wrapped there without changing expression scope.
+        return tree
+
+    def _stmts(self, stmts):
+        out = []
+        for stmt in stmts:
+            out.extend(self._stmt(stmt))
+        return out
+
+    def _stmt(self, node):
+        # Recurse into nested statement lists first.
+        for field in _STMT_LIST_FIELDS:
+            value = getattr(node, field, None)
+            if (
+                isinstance(value, list)
+                and value
+                and isinstance(value[0], _pyast.stmt)
+            ):
+                setattr(node, field, self._stmts(value))
+        if isinstance(node, _pyast.Try):
+            node.handlers = [self._handler(h) for h in node.handlers]
+        elif _AST_MATCH is not None and isinstance(node, _AST_MATCH):
+            for case in node.cases:
+                case.body = self._stmts(case.body)
+        if self._needs_wrap(node):
+            return self._wrap_node(node)
+        return [node]
+
+    def _handler(self, node):
+        # ExceptHandler.type is evaluated as part of the try statement;
+        # its body (a statement list) was intentionally not walked above.
+        node.body = self._stmts(node.body)
+        return node
+
+    @staticmethod
+    def _needs_wrap(node):
+        """True if the statement's *own* expressions contain a subproc
+        helper call (nested statement bodies excluded)."""
+        stack = [node]
+        is_root = True
+        while stack:
+            cur = stack.pop()
+            for field, value in _pyast.iter_fields(cur):
+                if isinstance(cur, _pyast.ExceptHandler) and field == "body":
+                    continue
+                if (
+                    field in _STMT_LIST_FIELDS
+                    and isinstance(value, list)
+                    and value
+                    and isinstance(value[0], _pyast.stmt)
+                ):
+                    continue
+                if (
+                    _AST_MATCH is not None
+                    and isinstance(cur, _AST_MATCH)
+                    and field == "cases"
+                ):
+                    for case in value:
+                        if case.guard is not None:
+                            stack.append(case.guard)
+                    continue
+                if isinstance(value, list):
+                    stack.extend(v for v in value if isinstance(v, _pyast.AST))
+                elif isinstance(value, _pyast.AST):
+                    stack.append(value)
+            if not is_root and _is_subproc_helper_call(cur):
+                return True
+            is_root = False
+        return False
+
+    def _wrap_node(self, node):
+        lineno = getattr(node, "lineno", 1)
+        col = getattr(node, "col_offset", 0)
+        end_lineno = getattr(node, "end_lineno", None) or lineno
+        end_col = getattr(node, "end_col_offset", None)
+        if end_col is None:
+            end_col = col
+        # All generated nodes share the original statement's source
+        # range. Explicit end positions are required because
+        # ``ast.fix_missing_locations`` would otherwise fill them with
+        # the enclosing module's invalid (0, 0) defaults.
+        locs = {
+            "lineno": lineno,
+            "col_offset": col,
+            "end_lineno": end_lineno,
+            "end_col_offset": end_col,
+        }
+        name = f"__xonsh_cwd_anchor_snap_{id(node)}__"
+        snap_name = _pyast.Name(id=name, ctx=_pyast.Store(), **locs)
+        snapshot_call = xonsh_call(
+            "__xonsh__.subproc_cwd_anchor_snapshot",
+            args=[],
+            lineno=lineno,
+            col=col,
+        )
+        for attr in ("end_lineno", "end_col_offset"):
+            setattr(snapshot_call, attr, locs[attr])
+        assign = _pyast.Assign(
+            targets=[snap_name], value=snapshot_call, **locs
+        )
+        load_name = _pyast.Name(id=name, ctx=_pyast.Load(), **locs)
+        restore_call = xonsh_call(
+            "__xonsh__.subproc_cwd_anchor_restore",
+            args=[load_name],
+            lineno=lineno,
+            col=col,
+        )
+        for attr in ("end_lineno", "end_col_offset"):
+            setattr(restore_call, attr, locs[attr])
+        final_expr = _pyast.Expr(value=restore_call, **locs)
+        try_finally = _pyast.Try(
+            body=[node],
+            handlers=[],
+            orelse=[],
+            finalbody=[final_expr],
+            **locs,
+        )
+        return [assign, try_finally]
+
+
+def wrap_subproc_cwd_anchors(tree):
+    """Public entry point — install CWD-anchor cleanup ``finally`` blocks
+    around statements that invoke subprocess helpers."""
+    return _SubprocCwdAnchorWrapper().wrap(tree)
 
 
 class Location:
@@ -904,6 +1079,26 @@ class BaseParser:
             lineno=lineno,
             col=col,
         )
+
+    def _subproc_helper_call(self, name, args, lineno=None, col=None):
+        """Build a ``__xonsh__.<subproc helper>(...)`` call that enters the
+        CWD anchor first.
+
+        The ``subproc_cwd_anchor_enter()`` marker MUST be the first
+        positional argument: Python evaluates call arguments left to
+        right, so this snapshots the real current directory before any
+        command name, argument, glob, nested capture or redirect operand
+        of the whole ``|`` pipeline is evaluated.
+        """
+        call = xonsh_call(name, args, lineno=lineno, col=col)
+        enter = xonsh_call(
+            "__xonsh__.subproc_cwd_anchor_enter",
+            args=[],
+            lineno=lineno,
+            col=col,
+        )
+        call.args.insert(0, enter)
+        return call
 
     #
     # Precedence of operators
@@ -3509,19 +3704,21 @@ class BaseParser:
                 value=xenv, slice=idx, ctx=ast.Load(), lineno=lineno, col_offset=col
             )
         elif p1 == "$(":
-            p0 = xonsh_call(
+            p0 = self._subproc_helper_call(
                 "__xonsh__.subproc_captured_stdout", p2, lineno=lineno, col=col
             )
         elif p1 == "!(":
-            p0 = xonsh_call(
+            p0 = self._subproc_helper_call(
                 "__xonsh__.subproc_captured_object", p2, lineno=lineno, col=col
             )
         elif p1 == "![":
-            p0 = xonsh_call(
+            p0 = self._subproc_helper_call(
                 "__xonsh__.subproc_captured_hiddenobject", p2, lineno=lineno, col=col
             )
         elif p1 == "$[":
-            p0 = xonsh_call("__xonsh__.subproc_uncaptured", p2, lineno=lineno, col=col)
+            p0 = self._subproc_helper_call(
+                "__xonsh__.subproc_uncaptured", p2, lineno=lineno, col=col
+            )
         else:
             raise AssertionError()
 
@@ -3761,7 +3958,7 @@ class BaseParser:
     def p_subproc_atom_uncaptured(self, p):
         """subproc_atom : dollar_lbracket_tok subproc RBRACKET"""
         p1 = p[1]
-        p0 = xonsh_call(
+        p0 = self._subproc_helper_call(
             "__xonsh__.subproc_uncaptured", args=p[2], lineno=p1.lineno, col=p1.lexpos
         )
         p0._cliarg_action = "splitlines"
@@ -3783,7 +3980,7 @@ class BaseParser:
         subproc_arg_part : dollar_lparen_tok subproc RPAREN
         """
         p1 = p[1]
-        p0 = xonsh_call(
+        p0 = self._subproc_helper_call(
             "__xonsh__.subproc_captured_stdout",
             args=p[2],
             lineno=p1.lineno,
@@ -3868,7 +4065,7 @@ class BaseParser:
         subproc_arg_part : atdollar_lparen_tok subproc RPAREN
         """
         p1, p2 = p[1], p[2]
-        p0 = xonsh_call(
+        p0 = self._subproc_helper_call(
             "__xonsh__.subproc_captured_inject", p2, lineno=p1.lineno, col=p1.lexpos
         )
         p0._cliarg_action = "extend"

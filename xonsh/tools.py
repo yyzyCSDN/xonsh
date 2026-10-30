@@ -2896,14 +2896,27 @@ def globpath(
     s, ignore_case=False, return_empty=False, sort_result=None, include_dotfiles=None
 ):
     """Simple wrapper around glob that also expands home and env vars."""
-    o, s = _iglobpath(
-        s,
+    # When a subprocess CWD anchor is active, glob from the anchored
+    # directory regardless of any os.chdir() performed by command
+    # expressions evaluated earlier; results stay anchor-relative.
+    anchor = xsh.current_subproc_cwd_anchor()
+    rooted = (
+        anchor is not None
+        and bool(s)
+        and not os.path.isabs(xsh.expand_path(s))
+    )
+    original_s = s
+    pattern = os.path.join(anchor, s) if rooted else s
+    o, _ = _iglobpath(
+        pattern,
         ignore_case=ignore_case,
         sort_result=sort_result,
         include_dotfiles=include_dotfiles,
     )
     o = list(o)
-    no_match = [] if return_empty else [s]
+    if rooted:
+        o = [os.path.relpath(p, anchor) for p in o]
+    no_match = [] if return_empty else [original_s]
     return o if len(o) != 0 else no_match
 
 
