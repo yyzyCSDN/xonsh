@@ -376,6 +376,8 @@ class CompletionContextParser:
         self.current_input = ""
         self.line_indices = ()
         self.paren_counts = defaultdict(int)
+        # (type, absolute_start, absolute_end) of the last returned token
+        self.prev_returned = None
 
         self.error = None
         self.debug = debug
@@ -418,6 +420,7 @@ class CompletionContextParser:
             match.start() + 1 for match in NEWLINE_RE.finditer(multiline_text)
         )
         self.paren_counts.clear()
+        self.prev_returned = None
         self.error = None
 
         try:
@@ -454,6 +457,11 @@ class CompletionContextParser:
         * handle a weird lexer behavior with ``AND``/``OR``.
         * set multi_tokens with cursor to type ``ANY``.
         * set mismatched closing parens to type ``ANY``.
+        * treat a ``!(`` glued directly onto a ``NAME`` (``f!(``) as an
+          ordinary token rather than a ``!()`` subprocess expression:
+          that spelling is a Python function-macro call, so its (possibly
+          unclosed, DSL) body must stay in the Python context instead of
+          being swallowed into a subprocess sub-command.
 
         The paren checking is needed since accepting both matched and unmatched parenthesis isn't possible with an LALR(1) parser.
         See https://stackoverflow.com/questions/8496065/why-is-this-lr1-grammar-not-lalr1
@@ -473,6 +481,25 @@ class CompletionContextParser:
             )
 
             tok.lexpos = lexpos = self.line_indices[lineno] + tok.lexpos
+            orig_type = tok.type
+
+            if (
+                tok.type == "BANG_LPAREN"
+                and self.prev_returned is not None
+                and self.prev_returned[0] == "NAME"
+                and self.prev_returned[2] == lexpos
+            ):
+                # ``name!(`` -- a function-macro trailer, not a ``!()``
+                # subprocess expression.  Its matching RPAREN then looks
+                # unmatched here and becomes ``ANY`` as well, leaving the
+                # whole macro call in the surrounding (Python) context.
+                tok.type = "ANY"
+                self.prev_returned = (
+                    orig_type,
+                    lexpos,
+                    lexpos + len(tok.value),
+                )
+                return tok
 
             if tok.type in self.multi_tokens:
                 # for some reason the lexer simulates ``and`` / ``or`` values for ``&&` / ``||``
@@ -504,6 +531,15 @@ class CompletionContextParser:
             elif tok.type in self.r_parens:
                 # tok.type is not in self.paren_counts, meaning this right paren is unmatched
                 tok.type = "ANY"
+
+            # remember the token's original type (most tokens are handed to
+            # the grammar as ``ANY``) so e.g. a ``NAME`` glued to ``!(`` is
+            # still recognizable as ``name!(``.
+            self.prev_returned = (
+                orig_type,
+                lexpos,
+                lexpos + len(tok.value),
+            )
 
             if tok.type in self.used_tokens:
                 return tok

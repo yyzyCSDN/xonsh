@@ -15,6 +15,7 @@ from xonsh.completers.commands import (
 from xonsh.completers.emoji import complete_emoji
 from xonsh.completers.environment import complete_environment_vars
 from xonsh.completers.imports import complete_import
+from xonsh.completers.macro import complete_macro_raw
 from xonsh.completers.man import complete_from_man
 from xonsh.completers.path import complete_path
 from xonsh.completers.python import complete_python, complete_xonsh_imp
@@ -23,6 +24,11 @@ from xonsh.completers.python import complete_python, complete_xonsh_imp
 def default_completers(cmd_cache):
     """Creates a copy of the default completers."""
     defaults = [
+        # exclusive completers:
+        # Raw-argument completion for registered function macros
+        # (``f!(...)``); must run first so a registered raw region receives
+        # only its own candidates, even when the result is empty.
+        ("macro_raw", complete_macro_raw),
         # non-exclusive completers:
         ("end_proc_tokens", complete_end_proc_tokens),
         ("end_proc_keywords", complete_end_proc_keywords),

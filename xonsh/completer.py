@@ -392,6 +392,13 @@ class Completer:
                             )
 
             if not items:  # empty completion
+                # ``out is None`` means the completer abstains from this
+                # context entirely -- fall through as usual. A non-None but
+                # empty result from an "exclusive-empty" completer means it
+                # owns the context: even with no candidates, later
+                # completers (python/path/…) must not mix theirs in.
+                if out is not None and getattr(func, "exclusive_empty", False):
+                    break
                 continue
 
             if exclusive:

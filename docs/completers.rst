@@ -24,6 +24,12 @@ completions can be ignored).
 This page details the internal structure of xonsh's completion system and
 includes instructions for implementing new tab completion functions.
 
+.. note::
+   To complete the raw arguments of a function macro (``f!(...)``), e.g. a DSL
+   like ``query!(SELECT ...)``, attach a completer directly to the macro
+   function instead -- see :ref:`macros` ("Completing Function Macro
+   Arguments").
+
 
 Structure
 ==========

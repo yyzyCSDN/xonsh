@@ -219,6 +219,25 @@ def is_exclusive_completer(func):
     return not getattr(func, "non_exclusive", False)
 
 
+def exclusive_empty_completer(func):
+    """Decorator for a completer whose empty result is still final.
+
+    Ordinary exclusive completers only stop the completer pipeline when they
+    return at least one candidate; an empty result lets the remaining
+    completers run. A completer marked with this decorator owns its context
+    completely -- when it runs there, an empty result stops the pipeline as
+    well, so no fallback completers (e.g. Python/path) mix in their own
+    candidates. Return ``None`` (or abstain earlier) for contexts the
+    completer does not own; those behave exactly as before.
+    """
+    func.exclusive_empty = True  # type: ignore
+    return func
+
+
+def is_exclusive_empty_completer(func):
+    return getattr(func, "exclusive_empty", False)
+
+
 def apply_lprefix(comps, lprefix):
     if lprefix is None:
         return comps

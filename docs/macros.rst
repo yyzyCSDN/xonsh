@@ -208,6 +208,105 @@ only a handful of args are expected as macro arguments.
 
 Hopefully, now you see the big picture.
 
+Completing Function Macro Arguments
+===================================
+Because macro arguments are captured as raw source text rather than parsed as
+Python, a macro that embeds a DSL -- such as ``query!(SELECT ..., ...)`` --
+cannot get useful candidates from the ordinary Python or path completers.
+Xonsh therefore lets a macro author attach a dedicated **raw-argument
+completer** directly to the macro function.
+
+Registration is function-level: decorate the function with
+:func:`~xonsh.completers.macro.macro_completer` (or assign any callable to its
+``__xonsh_macro_completer__`` attribute):
+
+.. code-block:: python
+
+    from xonsh.completers.macro import macro_completer, MacroRawCompletionContext
+
+    SQL_KEYWORDS = ("SELECT", "FROM", "WHERE", "GROUP BY", "ORDER BY")
+
+    def complete_sql(info: MacroRawCompletionContext):
+        # ``info.prefix`` is the current raw argument's text left of cursor.
+        matches = sorted(k for k in SQL_KEYWORDS if k.startswith(info.prefix))
+        if not matches:
+            # An explicit empty result still "owns" the region: no Python or
+            # path candidates are mixed in.
+            return None
+        # Replace exactly the typed prefix and insert candidates verbatim.
+        return matches, len(info.prefix)
+
+    @macro_completer(complete_sql)
+    def query(sql: str, *params):
+        ...
+
+The completer works wherever the macro is Python code -- a plain Python
+expression at the prompt (``query!(SE<TAB>``) or inside a shell Python
+sub-expression (``echo @(query!(SE<TAB>))``).
+
+Dispatch rules
+--------------
+* Only **plain Python functions reachable by their direct name** in the
+  current execution namespace are dispatched.  Dotted expressions
+  (``obj.query!(...)``), callables that are not plain functions, and names
+  absent from the namespace use the ordinary completion unchanged.
+* Nothing is executed or evaluated to find the macro target: the call site is
+  located lexically, the name is looked up directly in the namespace, and the
+  registered completer is called.  Macro arguments, annotation conversions
+  and the macro itself never run during completion.
+* Raw arguments are split on the macro grammar's **top-level commas**.
+  Brackets/parentheses/braces, strings (including f-strings), newlines and
+  text that looks like a nested ``inner!(...)`` call all stay part of the raw
+  argument they appear in.  An unclosed macro call is located as well.
+* After a macro argument that is a lone ``*`` (the regular-arguments
+  separator described above), completion switches back to ordinary Python
+  completion.  A function macro inside that regular region is dispatched on
+  its own raw region, and closing it restores the outer context.
+
+The completion context object
+-----------------------------
+The registered completer receives a
+:class:`~xonsh.completers.macro.MacroRawCompletionContext` with the following
+fields:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Field
+     - Description
+   * - ``macro_name``
+     - The direct name the macro was called with.
+   * - ``code``
+     - The complete input of the current Python expression (for a shell
+       ``@(...)`` this is the text inside ``@( )``).
+   * - ``raw_arg``
+     - The verbatim source text of the current top-level argument, including
+       whitespace, brackets, strings and newlines.
+   * - ``arg_index``
+     - Zero-based index of the current argument among the macro's top-level
+       arguments.
+   * - ``arg_start`` / ``arg_end``
+     - The absolute range of ``raw_arg`` in ``code`` (``arg_end`` is
+       ``len(code)`` for an unclosed macro call).
+   * - ``cursor_index``
+     - The absolute cursor position in ``code``.
+   * - ``cursor_in_arg``, ``prefix``, ``suffix``, ``arg_span``
+     - Convenience properties derived from the fields above.
+
+Return protocol
+---------------
+* ``None`` (or an empty result) -- the region owns completion, so *no*
+  fallback Python/path candidates are shown.
+* An iterable of candidate strings -- the whole raw-argument prefix before
+  the cursor is replaced on selection.
+* A ``(candidates, replace_len)`` tuple -- ``replace_len`` is the number of
+  characters to the left of the cursor that each candidate replaces.
+
+Only the candidate text and ``replace_len`` are honoured: the chosen candidate
+is inserted verbatim (xonsh adds no quotes, escapes or spaces), only the
+indicated prefix is replaced, and the other arguments as well as the text
+after the cursor are left untouched.
+
 Writing Function Macros
 =======================
 Though any function (or callable) can be used as a macro, this functionality
