@@ -342,6 +342,67 @@ Of course, many other more sophisticated options are available depending on the
 use case.
 
 
+Whole-Call Argument Precheck
+----------------------------
+Normally, macro arguments are converted one at a time, in call order. If a
+later argument is missing, carries an unrecognized annotation, or its source
+code cannot be parsed or compiled, an earlier ``eval``/``exec``/``type``
+argument may already have run and produced side effects. Macro authors who
+want such calls to fail *loudly and early* can opt in to a whole-call
+precheck with the ``@macro_precheck`` decorator (or by setting
+``f.__xonsh_macro_precheck__ = True`` manually):
+
+.. code-block:: python
+
+    from xonsh.built_ins import macro_precheck
+
+    @macro_precheck
+    def setup(first: exec, second: compile):
+        ...
+
+With precheck enabled, nothing in the call is executed until every argument
+has been validated. The caller then:
+
+1. Checks the shape of the whole call against the function signature.
+   Defaults, positional-only and keyword-only parameters (including the
+   ordinary parameters after a bare ``*``) are supported. Dynamic
+   ``*args``/``**kwargs`` unpacking in the call is rejected, and the
+   function itself must not declare var-positional or var-keyword
+   parameters.
+2. Resolves the annotation and mode actually used for every supplied macro
+   argument and validates its source according to that conversion category:
+
+   * ``str`` arguments are left untouched, so they may still contain any
+     DSL at all;
+   * ``ast`` arguments only need to parse in their mode;
+   * ``code`` and ``eval``/``exec``/``type`` arguments must compile in the
+     mode that conversion uses. Modes that the conversion itself ignores
+     today (for example the mode of an ``eval`` argument) are not enforced
+     any more strictly than before.
+3. Only after all of the above succeeds, the conversions and the regular
+   (post-``*``) argument expressions are executed exactly once each, in
+   their original order, and finally the macro body is called.
+
+The Python-vs-subprocess interpretation of every argument is taken from the
+namespace as it was when the precheck started. Even if an earlier argument
+adds or removes names, later arguments are not reinterpreted; however, the
+*values* of the names are still read from the live namespace when the
+arguments execute.
+
+The guarantee is deliberately scoped:
+
+* arguments are never run to "guess" their values, and runtime errors that
+  only appear while executing a valid argument (including failures nested in
+  a call inside that argument) are not prevented;
+* side effects produced during the execution phase are not rolled back --
+  if argument one runs and argument two then raises at runtime, argument
+  one's effects remain;
+* the expression naming the macro function itself, and everything that
+  happens while the function is being defined, are outside the guarantee;
+* functions without the marker keep the existing, per-argument macro
+  semantics unchanged.
+
+
 Subprocess Macros
 =================
 Like with function macros above, subprocess macros allow you to pause the parser

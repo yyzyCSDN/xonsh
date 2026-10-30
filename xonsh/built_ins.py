@@ -673,6 +673,126 @@ def _convert_kind_flag(x):
     return kind
 
 
+def _split_macro_kind_mode(kind):
+    """Canonicalizes a macro annotation into a ``(kind, mode)`` pair.
+
+    String flags are converted to the corresponding builtin objects via
+    :data:`MACRO_FLAG_KINDS`; unknown flags raise ``TypeError``.
+    """
+    mode = None
+    if isinstance(kind, cabc.Sequence) and not isinstance(kind, str):
+        # have (kind, mode) tuple
+        kind, mode = kind
+    if isinstance(kind, str):
+        kind = _convert_kind_flag(kind)
+    return kind, mode
+
+
+def _prepare_macro_arg(
+    raw_arg, kind, glbs, locs, *, name="<arg>", macroname="<macro>"
+):
+    """Does everything that is needed to convert a string macro argument
+    *without executing it*.
+
+    Returns a ``(tag, obj, mode)`` triple where ``tag`` is one of:
+
+    * ``"value"`` -- ``obj`` is the converted argument itself (str/None
+      arguments, parsed AST nodes, and compiled code objects);
+    * ``"eval"`` -- ``obj`` is a code object to be evaluated;
+    * ``"exec"`` -- ``obj`` is a code object to be execed in ``mode``;
+    * ``"type"`` -- ``obj`` is a code object whose result's type is wanted.
+
+    Use :func:`_run_prepared_macro_arg` to finish the conversion.
+    Splitting preparation and execution lets prechecked macro calls parse
+    and compile every argument up front (against a fixed namespace) while
+    still only evaluating each argument once, later.
+
+    Parameters
+    ----------
+    raw_arg : str
+        The str representation of the macro argument.
+    kind : object
+        A flag or type representing how to convert the argument.
+    glbs : Mapping
+        The globals from the call site (may be a frozen-key view).
+    locs : Mapping or None
+        The locals from the call site (may be a frozen-key view).
+    name : str, optional
+        The macro argument name.
+    macroname : str, optional
+        The name of the macro itself.
+    """
+    kind, mode = _split_macro_kind_mode(kind)
+    if kind is str or kind is None:
+        return ("value", raw_arg, None)  # nothing to parse, compile, or run
+    # select from kind and prepare
+    execer = XSH.execer
+    filename = macroname + "(" + name + ")"
+    if kind is AST:
+        ctx = set(dir(builtins)) | set(glbs.keys())
+        if locs is not None:
+            ctx |= set(locs.keys())
+        mode = mode or "eval"
+        if mode != "eval" and not raw_arg.endswith("\n"):
+            raw_arg += "\n"
+        arg = execer.parse(raw_arg, ctx, mode=mode, filename=filename)
+        return ("value", arg, None)
+    elif kind is types.CodeType or kind is compile:  # NOQA
+        mode = mode or "eval"
+        arg = execer.compile(
+            raw_arg, mode=mode, glbs=glbs, locs=locs, filename=filename
+        )
+        return ("value", arg, None)
+    elif kind is eval:
+        # note: the mode of an eval argument is historically ignored, so it
+        # is intentionally not consulted here either
+        code = execer.compile(
+            raw_arg.rstrip("\n"),
+            mode="eval",
+            glbs=glbs,
+            locs=locs,
+            filename=filename,
+        )
+        return ("eval", code, None)
+    elif kind is exec:
+        mode = mode or "exec"
+        if not raw_arg.endswith("\n"):
+            raw_arg += "\n"
+        code = execer.compile(
+            raw_arg, mode=mode, glbs=glbs, locs=locs, filename=filename
+        )
+        return ("exec", code, mode)
+    elif kind is type:
+        code = execer.compile(
+            raw_arg.rstrip("\n"),
+            mode="eval",
+            glbs=glbs,
+            locs=locs,
+            filename=filename,
+        )
+        return ("type", code, None)
+    else:
+        msg = "kind={0!r} and mode={1!r} was not recognized for macro argument {2!r}"
+        raise TypeError(msg.format(kind, mode, name))
+
+
+def _run_prepared_macro_arg(prepared, glbs, locs):
+    """Finishes converting a macro argument prepared by
+    :func:`_prepare_macro_arg`, executing it if necessary."""
+    tag, obj, mode = prepared
+    if tag == "value":
+        return obj
+    elif tag == "eval":
+        return XSH.execer.eval(obj, glbs=glbs, locs=locs)
+    elif tag == "exec":
+        return XSH.execer.exec(obj, mode=mode, glbs=glbs, locs=locs)
+    elif tag == "type":
+        return type(XSH.execer.eval(obj, glbs=glbs, locs=locs))
+    else:
+        # should be unreachable
+        raise AssertionError(f"unknown prepared macro argument tag: {tag!r}")
+
+
 def convert_macro_arg(raw_arg, kind, glbs, locs, *, name="<arg>", macroname="<macro>"):
     """Converts a string macro argument based on the requested kind.
 
@@ -695,44 +815,10 @@ def convert_macro_arg(raw_arg, kind, glbs, locs, *, name="<arg>", macroname="<ma
     -------
     The converted argument.
     """
-    # munge kind and mode to start
-    mode = None
-    if isinstance(kind, cabc.Sequence) and not isinstance(kind, str):
-        # have (kind, mode) tuple
-        kind, mode = kind
-    if isinstance(kind, str):
-        kind = _convert_kind_flag(kind)
-    if kind is str or kind is None:
-        return raw_arg  # short circuit since there is nothing else to do
-    # select from kind and convert
-    execer = XSH.execer
-    filename = macroname + "(" + name + ")"
-    if kind is AST:
-        ctx = set(dir(builtins)) | set(glbs.keys())
-        if locs is not None:
-            ctx |= set(locs.keys())
-        mode = mode or "eval"
-        if mode != "eval" and not raw_arg.endswith("\n"):
-            raw_arg += "\n"
-        arg = execer.parse(raw_arg, ctx, mode=mode, filename=filename)
-    elif kind is types.CodeType or kind is compile:  # NOQA
-        mode = mode or "eval"
-        arg = execer.compile(
-            raw_arg, mode=mode, glbs=glbs, locs=locs, filename=filename
-        )
-    elif kind is eval:
-        arg = execer.eval(raw_arg, glbs=glbs, locs=locs, filename=filename)
-    elif kind is exec:
-        mode = mode or "exec"
-        if not raw_arg.endswith("\n"):
-            raw_arg += "\n"
-        arg = execer.exec(raw_arg, mode=mode, glbs=glbs, locs=locs, filename=filename)
-    elif kind is type:
-        arg = type(execer.eval(raw_arg, glbs=glbs, locs=locs, filename=filename))
-    else:
-        msg = "kind={0!r} and mode={1!r} was not recognized for macro argument {2!r}"
-        raise TypeError(msg.format(kind, mode, name))
-    return arg
+    prepared = _prepare_macro_arg(
+        raw_arg, kind, glbs, locs, name=name, macroname=macroname
+    )
+    return _run_prepared_macro_arg(prepared, glbs, locs)
 
 
 @contextlib.contextmanager
@@ -764,6 +850,22 @@ def in_macro_call(f, glbs, locs):
         f.macro_locals = prev_locs
 
 
+MACRO_PRECHECK_ATTR = "__xonsh_macro_precheck__"
+
+
+def macro_precheck(f):
+    """Decorator enabling whole-call argument preflight for a function macro.
+
+    Attach it to a macro function (or set ``f.__xonsh_macro_precheck__ = True``
+    manually) to make the macro caller validate the *entire* call before any
+    macro argument expression is executed or the macro body is entered. See
+    :func:`call_macro` and the macro documentation for the exact guarantees
+    and limitations.
+    """
+    setattr(f, MACRO_PRECHECK_ATTR, True)
+    return f
+
+
 def call_macro(f, raw_args, glbs, locs):
     """Calls a function as a macro, returning its result.
 
@@ -779,10 +881,27 @@ def call_macro(f, raw_args, glbs, locs):
         The globals from the call site.
     locs : Mapping or None
         The locals from the call site.
+
+    Notes
+    -----
+    By default macro arguments are converted one at a time, so a failing
+    later argument does not undo the side effects of earlier ones. If ``f``
+    is marked with :func:`macro_precheck` (i.e.
+    ``getattr(f, "__xonsh_macro_precheck__", False)`` is true), the whole
+    call is preflighted first: its argument shape is checked against the
+    signature and every argument source is validated according to the
+    annotation/mode that will actually be used (strings are left untouched,
+    AST sources are parsed, code/eval/exec/type sources are compiled). Only
+    if all of that succeeds are the conversions and regular argument
+    expressions executed exactly once, in their original order, followed by
+    the macro body itself.
     """
     sig = inspect.signature(f)
-    empty = inspect.Parameter.empty
     macroname = f.__name__
+    if getattr(f, MACRO_PRECHECK_ATTR, False):
+        plan = _precheck_macro_call(sig, raw_args, glbs, locs, macroname)
+        return _run_prechecked_macro_call(f, plan, glbs, locs)
+    empty = inspect.Parameter.empty
     i = 0
     args = []
     for (key, param), raw_arg in zip(sig.parameters.items(), raw_args, strict=False):
@@ -833,6 +952,194 @@ def _eval_regular_args(raw_args, glbs, locs):
         both = f"({argstr}, {kwargstr})"
         args, kwargs = execer.eval(both, glbs=glbs, locs=locs)
     return args, kwargs
+
+
+class _FrozenKeysMapping(cabc.Mapping):
+    """A read-only mapping view that exposes a fixed key set while still
+    reading values from the underlying, possibly mutated, mapping.
+
+    This is how prechecked macro calls freeze the name set used for
+    Python/subprocess interpretation without freezing the values themselves.
+    """
+
+    def __init__(self, data, keys):
+        self._data = data
+        self._keys = frozenset(keys)
+
+    def __getitem__(self, key):
+        return self._data[key]
+
+    def __iter__(self):
+        return iter(self._keys)
+
+    def __len__(self):
+        return len(self._keys)
+
+    def keys(self):
+        return set(self._keys)
+
+
+def _freeze_macro_namespaces(glbs, locs):
+    """Builds frozen-key views of the call-site namespaces for preflight."""
+    glb_data = glbs if glbs is not None else {}
+    loc_data = locs if locs is not None else {}
+    fglbs = _FrozenKeysMapping(glb_data, set(glb_data.keys()))
+    flocs = _FrozenKeysMapping(loc_data, set(loc_data.keys()))
+    return fglbs, flocs
+
+
+def _split_raw_macro_args(raw_args):
+    """Splits raw arguments at the lone ``*`` separator into
+    ``(macro_args, regular_args)``, mirroring the non-prechecked caller."""
+    for i, raw_arg in enumerate(raw_args):
+        if raw_arg == "*":
+            return list(raw_args[:i]), list(raw_args[i + 1 :])
+    return list(raw_args), []
+
+
+def _precheck_macro_call(sig, raw_args, glbs, locs, macroname):
+    """Validates a whole macro call without executing any of its arguments.
+
+    Raises before executing anything if the function is not eligible
+    (var-positional/var-keyword parameters), the call contains dynamic
+    ``*args``/``**kwargs`` unpacking, the argument shape does not match the
+    signature, an annotation cannot be resolved, or any argument source
+    fails parsing/compilation under the annotation/mode that would be used.
+
+    Returns a plan consumable by :func:`_run_prechecked_macro_call`.
+    """
+    params = list(sig.parameters.values())
+    # only ordinary functions with stable, fully-bound signatures are covered
+    for param in params:
+        if param.kind == inspect.Parameter.VAR_POSITIONAL:
+            raise TypeError(
+                f"macro precheck is not available for {macroname}(): it has a "
+                f"var-positional parameter *{param.name}."
+            )
+        elif param.kind == inspect.Parameter.VAR_KEYWORD:
+            raise TypeError(
+                f"macro precheck is not available for {macroname}(): it has a "
+                f"var-keyword parameter **{param.name}."
+            )
+    macro_raw, regular_raw = _split_raw_macro_args(raw_args)
+    # split the regular part into positional expressions and ``name=expr``
+    # pairs, exactly like the non-prechecked caller does
+    arglist = list(itertools.takewhile(_starts_as_arg, regular_raw))
+    kwarglist = regular_raw[len(arglist) :]
+    for raw_arg in arglist:
+        if raw_arg.startswith("*"):
+            raise TypeError(
+                f"macro precheck cannot handle dynamic argument unpacking in "
+                f"{macroname}(): {raw_arg!r}; pass the expanded arguments "
+                f"explicitly instead."
+            )
+    reg_kwargs = []
+    for raw_arg in kwarglist:
+        if raw_arg.startswith("**"):
+            raise TypeError(
+                f"macro precheck cannot handle dynamic keyword unpacking in "
+                f"{macroname}(): {raw_arg!r}; pass the keyword arguments "
+                f"explicitly instead."
+            )
+        match = KWARG_RE.match(raw_arg)
+        # guaranteed by the _starts_as_arg split: either "name=" or "**"
+        name = match.group(1)[:-1]
+        reg_kwargs.append(name)
+    # too many macro arguments for the signature
+    if len(macro_raw) > len(params):
+        raise TypeError(
+            f"{macroname}() takes {len(params)} macro argument(s) but "
+            f"{len(macro_raw)} were given."
+        )
+    # check the overall shape with a placeholder binding: this raises the
+    # canonical errors for missing/duplicate/unexpected arguments, defaults
+    # are accepted automatically
+    n_positional = sum(
+        1
+        for i in range(len(macro_raw))
+        if params[i].kind != inspect.Parameter.KEYWORD_ONLY
+    ) + len(arglist)
+    kw_names = {}
+    for i in range(len(macro_raw)):
+        if params[i].kind == inspect.Parameter.KEYWORD_ONLY:
+            kw_names[params[i].name] = None
+    for name in reg_kwargs:
+        # a dict would silently collapse a repeated keyword, and the
+        # placeholder bind below could no longer see the conflict
+        if name in kw_names:
+            raise TypeError(
+                f"{macroname}() got multiple values for argument {name!r}."
+            )
+        kw_names[name] = None
+    missing = object()
+    sig.bind(
+        *([missing] * n_positional), **{name: missing for name in kw_names}
+    )
+    # freeze the names used while interpreting sources
+    fglbs, flocs = _freeze_macro_namespaces(glbs, locs)
+    # prepare macro arguments: parse/compile per annotation, never execute
+    empty = inspect.Parameter.empty
+    prepared_macro = []
+    for i, raw_arg in enumerate(macro_raw):
+        param = params[i]
+        kind = param.annotation
+        if kind is empty or kind is None:
+            kind = str
+        prepared = _prepare_macro_arg(
+            raw_arg,
+            kind,
+            fglbs,
+            flocs,
+            name=param.name,
+            macroname=macroname,
+        )
+        if param.kind == inspect.Parameter.KEYWORD_ONLY:
+            slot = ("kw", param.name)
+        else:
+            slot = ("pos", None)
+        prepared_macro.append((slot, prepared))
+    # regular argument expressions only need to compile in eval mode;
+    # build exactly the same sources the non-prechecked caller evaluates
+    execer = XSH.execer
+    pos_code = None
+    if arglist:
+        pos_src = "({},)".format(", ".join(arglist))
+        pos_code = execer.compile(
+            pos_src.rstrip("\n"), mode="eval", glbs=fglbs, locs=flocs
+        )
+    kw_code = None
+    if kwarglist:
+        kw_src = "dict({})".format(", ".join(kwarglist))
+        kw_code = execer.compile(
+            kw_src.rstrip("\n"), mode="eval", glbs=fglbs, locs=flocs
+        )
+    return {
+        "macro": prepared_macro,
+        "pos_code": pos_code,
+        "kw_code": kw_code,
+    }
+
+
+def _run_prechecked_macro_call(f, plan, glbs, locs):
+    """Executes a preflighted macro call plan: each conversion and regular
+    argument expression runs exactly once, in the original order, and only
+    then is the macro body called. Values are read from the live call-site
+    namespaces, even though their name set was frozen during preflight."""
+    args = []
+    kwargs = {}
+    for slot, prepared in plan["macro"]:
+        value = _run_prepared_macro_arg(prepared, glbs, locs)
+        if slot[0] == "kw":
+            kwargs[slot[1]] = value
+        else:
+            args.append(value)
+    if plan["pos_code"] is not None:
+        args.extend(XSH.execer.eval(plan["pos_code"], glbs=glbs, locs=locs))
+    if plan["kw_code"] is not None:
+        kwargs.update(XSH.execer.eval(plan["kw_code"], glbs=glbs, locs=locs))
+    with in_macro_call(f, glbs, locs):
+        rtn = f(*args, **kwargs)
+    return rtn
 
 
 def enter_macro(obj, raw_block, glbs, locs):

@@ -4,7 +4,8 @@ import os
 import re
 import shutil
 import types
-from ast import AST, Expression, Interactive, Module
+import ast
+from ast import AST, Attribute, Call, Expression, Interactive, Module, Name
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,7 @@ from xonsh.built_ins import (
     in_macro_call,
     list_of_list_of_strs_outer_product,
     list_of_strs_or_callables,
+    macro_precheck,
     path_literal,
     pathsearch,
     regexmatchsearch,
@@ -549,6 +551,333 @@ def test_call_macro_ast_exec_statement():
 
     rtn = call_macro(f, ["x = 5"], {}, None)
     assert isinstance(rtn, Module)
+
+
+# ---------------------------------------------------------------------------
+# Whole-call argument precheck for function macros
+# ---------------------------------------------------------------------------
+
+
+def _is_subproc_tree(tree):
+    """True if a parsed macro argument was interpreted as a subprocess call."""
+    for node in ast.walk(tree):
+        if isinstance(node, Call) and isinstance(node.func, Attribute):
+            value = node.func.value
+            if isinstance(value, Name) and value.id == "__xonsh__":
+                if node.func.attr.startswith("subproc"):
+                    return True
+    return False
+
+
+def test_macro_precheck_decorator_marks_function():
+    @macro_precheck
+    def f(x: eval):
+        return x
+
+    assert f.__xonsh_macro_precheck__ is True
+
+
+def test_macro_precheck_attribute_opt_in():
+    def f(x: eval):
+        return x
+
+    f.__xonsh_macro_precheck__ = True
+    assert call_macro(f, ["40 + 2"], {}, None) == 42
+
+
+def test_macro_precheck_runs_everything_once_in_order():
+    log = []
+
+    @macro_precheck
+    def f(a: eval, b: exec, c: eval):
+        log.append(("body", a, c))
+
+    glbs = {"log": log, "x": 10}
+    call_macro(f, ["x", "log.append(('exec', x))", "x + 5"], glbs, None)
+    assert log == [("exec", 10), ("body", 10, 15)]
+
+
+def test_macro_precheck_missing_argument_runs_nothing():
+    log = []
+
+    @macro_precheck
+    def f(a: eval, b: eval):
+        log.append("body")
+
+    with pytest.raises(TypeError):
+        call_macro(f, ["log.append('arg')"], {"log": log}, None)
+    assert log == []
+
+
+@pytest.mark.parametrize("bad_kind", ["bogus", ("nope", "eval")])
+def test_macro_precheck_invalid_annotation_runs_nothing(bad_kind):
+    log = []
+
+    def f(a: eval, b: bad_kind):
+        log.append("body")
+
+    macro_precheck(f)
+    with pytest.raises(TypeError):
+        call_macro(f, ["log.append('arg')", "1"], {"log": log}, None)
+    assert log == []
+
+
+@pytest.mark.parametrize(
+    "kind,src",
+    [
+        (compile, "x ="),
+        ("code", "x ="),
+        (eval, "x ="),
+        (type, "x ="),
+        (exec, "return 1"),
+        (("ast", "eval"), "x = 1"),
+    ],
+)
+def test_macro_precheck_uncompilable_later_arg_runs_nothing(kind, src):
+    log = []
+
+    @macro_precheck
+    def f(a: exec, b: kind):
+        log.append("body")
+
+    with pytest.raises(SyntaxError):
+        call_macro(f, ["log.append('earlier')", src], {"log": log}, None)
+    assert log == []
+
+
+def test_without_precheck_earlier_side_effects_remain():
+    # documents the old, opt-out semantics: a failing later argument does
+    # not undo an earlier eval/exec argument
+    log = []
+
+    def f(a: exec, b: compile):
+        log.append("body")
+
+    with pytest.raises(SyntaxError):
+        call_macro(f, ["log.append('earlier')", "x ="], {"log": log}, None)
+    assert log == ["earlier"]
+
+
+def test_macro_precheck_allows_arbitrary_dsl_in_string_args():
+    seen = []
+
+    @macro_precheck
+    def f(a: str, b: ("s", "whatever"), c: compile):
+        seen.extend([a, b])
+        return c
+
+    code = call_macro(
+        f,
+        ["std::vector<std::string> x = {}", "import os ; weird DSL !!!", "42"],
+        {},
+        None,
+    )
+    assert isinstance(code, types.CodeType)
+    assert seen == ["std::vector<std::string> x = {}", "import os ; weird DSL !!!"]
+
+
+def test_macro_precheck_does_not_enforce_mode_ignored_by_eval():
+    # the eval kind historically ignores its mode, so precheck must neither
+    # tighten it (statements still fail) nor start honoring it
+    @macro_precheck
+    def f(a: (eval, "exec")):
+        return a
+
+    with pytest.raises(SyntaxError):
+        call_macro(f, ["x = 1"], {}, None)
+    assert call_macro(f, ["6 * 7"], {}, None) == 42
+
+
+def test_macro_precheck_defaults_positional_only_and_keyword_only():
+    calls = []
+
+    @macro_precheck
+    def f(a: eval, /, b: eval = 10, *, c: eval = 100):
+        calls.append((a, b, c))
+
+    # keyword-only macro slot is passed by keyword internally
+    call_macro(f, ["1", "2", "3"], {}, None)
+    assert calls == [(1, 2, 3)]
+    # missing macro arguments fall back to their defaults
+    call_macro(f, ["1"], {}, None)
+    assert calls[-1] == (1, 10, 100)
+
+
+def test_macro_precheck_keyword_only_slot_evaluation_order():
+    log = []
+
+    @macro_precheck
+    def f(a: eval, *, b: eval):
+        log.append(("body", a, b))
+
+    call_macro(
+        f,
+        ["log.append('a') or 1", "log.append('b') or 2"],
+        {"log": log},
+        None,
+    )
+    assert log == ["a", "b", ("body", 1, 2)]
+
+
+def test_macro_precheck_regular_args_after_separator():
+    calls = []
+
+    @macro_precheck
+    def f(a: str, b, c=0, *, d=0):
+        calls.append((a, b, c, d))
+
+    call_macro(f, ["src", "*", "41", "c=1", "d=2"], {}, None)
+    assert calls == [("src", 41, 1, 2)]
+    # duplicate value for the already-macro-bound 'a'
+    with pytest.raises(TypeError):
+        call_macro(f, ["src", "*", "a=1"], {}, None)
+    # too many positional arguments (d is keyword-only)
+    with pytest.raises(TypeError):
+        call_macro(f, ["src", "*", "1", "2", "3"], {}, None)
+    # unexpected keyword argument
+    with pytest.raises(TypeError):
+        call_macro(f, ["src", "*", "nope=1"], {}, None)
+    # body never ran for the failing shapes
+    assert calls == [("src", 41, 1, 2)]
+
+
+def test_macro_precheck_positional_only_cannot_be_keyword():
+    @macro_precheck
+    def f(a: eval, /, b: eval = 0):
+        return (a, b)
+
+    assert call_macro(f, ["*", "1", "b=2"], {}, None) == (1, 2)
+    with pytest.raises(TypeError):
+        call_macro(f, ["*", "a=1"], {}, None)
+
+
+def test_macro_precheck_rejects_repeated_keyword_arguments():
+    ran = []
+
+    @macro_precheck
+    def f(a: eval, *, b: eval = 0):
+        ran.append((a, b))
+
+    # keyword-only macro slot supplied again as a regular keyword
+    with pytest.raises(TypeError):
+        call_macro(f, ["1", "2", "*", "b=3"], {}, None)
+    # same regular keyword given twice
+    with pytest.raises(TypeError):
+        call_macro(f, ["1", "*", "b=2", "b=3"], {}, None)
+    assert ran == []
+    # but the keyword-only slot alone works
+    call_macro(f, ["1", "2"], {}, None)
+    assert ran == [(1, 2)]
+
+
+@pytest.mark.parametrize("extra", [["*items"], ["**d"]])
+def test_macro_precheck_rejects_dynamic_unpacking(extra):
+    ran = []
+
+    @macro_precheck
+    def f(a: eval):
+        ran.append(True)
+
+    glbs = {"items": [1], "d": {"a": 1}}
+    with pytest.raises(TypeError):
+        call_macro(f, ["*"] + extra, glbs, None)
+    assert ran == []
+
+
+@pytest.mark.parametrize(
+    "src", ["def f(*args):\n    pass\n", "def f(**kwargs):\n    pass\n"]
+)
+def test_macro_precheck_rejects_var_parameters(src):
+    ns = {}
+    exec(src, ns)
+    f = ns["f"]
+    macro_precheck(f)
+    with pytest.raises(TypeError):
+        call_macro(f, ["1"], {}, None)
+
+
+def test_macro_precheck_freezes_interpretation_namespace():
+    seen = {}
+
+    @macro_precheck
+    def f(a: exec, b: ("ast", "exec")):
+        seen["b"] = b
+
+    glbs = {}
+    call_macro(f, ["mycmd = 1", "mycmd"], glbs, None)
+    assert glbs["mycmd"] == 1  # the executed value is read live
+    # 'mycmd' was unknown when preflight started, so b stays a subprocess node
+    assert _is_subproc_tree(seen["b"])
+
+    # without precheck the later argument is re-parsed after a defines the name
+    def g(a: exec, b: ("ast", "exec")):
+        seen["g"] = b
+
+    call_macro(g, ["mycmd = 2", "mycmd"], glbs, None)
+    assert not _is_subproc_tree(seen["g"])
+
+
+def test_macro_precheck_still_reads_live_values():
+    @macro_precheck
+    def f(a: exec, b: eval):
+        return b
+
+    # 'x' is part of the frozen name set so b stays a Python expression,
+    # even though its value changes before b actually runs
+    glbs = {"x": 0}
+    assert call_macro(f, ["x = 40", "x + 2"], glbs, None) == 42
+    assert glbs["x"] == 40
+
+
+def test_macro_precheck_does_not_catch_runtime_errors_or_roll_back():
+    log = []
+
+    @macro_precheck
+    def f(a: exec, b: eval):
+        log.append("body")
+
+    # sources compile fine; the runtime failure is not promised away and the
+    # earlier exec side effect is not rolled back
+    with pytest.raises(ZeroDivisionError):
+        call_macro(f, ["log.append('earlier')", "1 / 0"], {"log": log}, None)
+    assert log == ["earlier"]
+
+
+def test_macro_precheck_compilable_but_failing_arg_skips_body():
+    log = []
+
+    @macro_precheck
+    def f(a: eval):
+        log.append("body")
+
+    with pytest.raises(ValueError):
+        call_macro(f, ["int('not a number')"], {"log": log}, None)
+    assert log == []
+
+
+def test_macro_precheck_end_to_end(xonsh_execer):
+    glbs = {"macro_precheck": macro_precheck, "out": []}
+    src = (
+        "@macro_precheck\n"
+        "def m(a: eval, *, b: eval):\n"
+        "    out.append((a, b))\n"
+        "m!(10, *, b=32)\n"
+    )
+    xonsh_execer.exec(src, glbs=glbs, locs=glbs)
+    assert glbs["out"] == [(10, 32)]
+
+
+def test_macro_precheck_end_to_end_failure_runs_nothing(xonsh_execer):
+    glbs = {"macro_precheck": macro_precheck, "out": []}
+    src = (
+        "@macro_precheck\n"
+        "def m(a: eval, b: eval):\n"
+        "    out.append('body')\n"
+        "m!(out.append('arg'), x =)\n"
+    )
+    with pytest.raises(SyntaxError):
+        xonsh_execer.exec(src, glbs=glbs, locs=glbs)
+    assert glbs["out"] == []
 
 
 def test_enter_macro():
